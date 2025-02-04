@@ -24,6 +24,8 @@ console.error = function () {
 const stateStore = {};
 const pageCacheTimes= {};
 
+let browser; // Declare browser globally
+
 var mqttClient = {};
 
 (async () => {
@@ -48,7 +50,7 @@ var mqttClient = {};
   }
 
   console.log("Starting browser...");
-  let browser = await puppeteer.launch({
+  browser = await puppeteer.launch({
     args: [
       "--disable-dev-shm-usage",
       "--no-sandbox",
@@ -173,13 +175,56 @@ var mqttClient = {};
 })();
 
 async function mqttConnect() {
+  const updateTopic = `homeassistant/screenshot/update`;
+
   console.log(`Attempting to connect to mqtt://${config.mqttServer}`);
-  mqttClient = mqtt.connect(`mqtt://${config.mqttServer}`,{clientId:"hass-screenshot", username: config.mqttUser, password: config.mqttPassword});
-  mqttClient.on("connect",function(connack){
-    console.log("MQTT Connected!");
+  mqttClient = mqtt.connect(`mqtt://${config.mqttServer}`, {
+    clientId: "hass-screenshot",
+    username: config.mqttUser,
+    password: config.mqttPassword
   });
-  mqttClient.on("error",function(error){
+
+  mqttClient.on("connect", function () {
+    console.log("MQTT Connected!");
+    mqttClient.subscribe(updateTopic, (err) => {
+      if (!err) {
+        console.log("Subscribed to MQTT screenshot update topic");
+      } else {
+        console.error("Failed to subscribe:", err);
+      }
+    });
+  });
+
+  mqttClient.on("error", function (error) {
     console.error("MQTT error:" + error);
+  });
+
+  mqttClient.on("message", async function (topic, message) {
+    if (topic === "homeassistant/screenshot/update") {
+      const pageNumber = parseInt(message.toString(), 10);
+  
+      if (isNaN(pageNumber) || pageNumber < 0 || pageNumber > config.pages.length) {
+        console.error("Invalid page number received:", message.toString());
+        return;
+      }
+  
+      if (!browser) {
+        console.error("Error: Puppeteer browser instance is not initialized.");
+        return;
+      }
+  
+      if (pageNumber === 0) {
+        console.log(`Received MQTT request to update all screenshots.`);
+        for (const pageConfig of config.pages) {
+          await renderAndConvertPageAsync(browser, pageConfig);
+        }
+        console.log(`All pages updated.`);
+      } else {
+        console.log(`Received MQTT request to update screenshot for page ${pageNumber}`);
+        const pageConfig = config.pages[pageNumber - 1];
+        await renderAndConvertPageAsync(browser, pageConfig);
+      }
+    }
   });
 }
 
@@ -324,6 +369,24 @@ async function renderAndConvertPageAsync(browser, pageConfig) {
   fs.unlink(tempPath);
   console.log(`Finished ${url}`);
   pageCacheTimes[pageConfig.screenShotUrl] = new Date();
+
+  // Send MQTT message to notify completion
+  if (mqttClient && mqttClient.connected) {
+    const message = {
+      page: pageConfig.screenShotUrl,
+      timestamp: new Date().toISOString(),
+      outputPath: outputPath
+    };
+
+    const topic = "homeassistant/screenshot/updated";
+    mqttClient.publish(topic, JSON.stringify(message), { qos: 1, retain: false }, (error) => {
+      if (error) {
+        console.error(`MQTT publish error on topic "${topic}": ${error}`);
+      } else {
+        console.log(`MQTT update notification sent for ${pageConfig.screenShotUrl}`);
+      }
+    });
+  }
 }
 
 async function renderUrlToImageAsync(browser, pageConfig, url, path) {
